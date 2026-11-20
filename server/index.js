@@ -60,29 +60,43 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '1mb' }));
 
-function signSession(expiresAt) {
-  return crypto.createHmac('sha256', SESSION_SECRET).update(String(expiresAt)).digest('hex');
+function signSession(expiresAt, username) {
+  return crypto.createHmac('sha256', SESSION_SECRET).update(`${expiresAt}.${username}`).digest('hex');
 }
 
-function hasValidSession(req) {
+function getSessionUsername(req) {
   const cookie = req.headers.cookie || '';
   const match = cookie.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]+)`));
-  if (!match) return false;
+  if (!match) return '';
 
   let decodedCookie;
   try {
     decodedCookie = decodeURIComponent(match[1]);
   } catch {
-    return false;
+    return '';
   }
-  const [expiresAtText, suppliedSignature] = decodedCookie.split('.');
+  const [expiresAtText, encodedUsername, suppliedSignature] = decodedCookie.split('.');
   const expiresAt = Number(expiresAtText);
-  if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) return false;
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now() || !encodedUsername) return '';
 
-  const expectedSignature = signSession(expiresAt);
+  let username;
+  try {
+    username = Buffer.from(encodedUsername, 'base64url').toString('utf8');
+  } catch {
+    return '';
+  }
+  if (!username || username.length > 48) return '';
+
+  const expectedSignature = signSession(expiresAt, username);
   const supplied = Buffer.from(suppliedSignature || '', 'hex');
   const expected = Buffer.from(expectedSignature, 'hex');
-  return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+  return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected)
+    ? username
+    : '';
+}
+
+function hasValidSession(req) {
+  return Boolean(getSessionUsername(req));
 }
 
 function requireWorkspaceAccess(req, res, next) {
@@ -105,7 +119,12 @@ function requireWorkspaceAccess(req, res, next) {
 
 app.get('/api/auth/status', (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json({ required: Boolean(APP_PASSWORD), authenticated: !APP_PASSWORD || hasValidSession(req) });
+  const username = getSessionUsername(req);
+  res.json({
+    required: Boolean(APP_PASSWORD),
+    authenticated: !APP_PASSWORD || Boolean(username),
+    username,
+  });
 });
 
 app.post('/api/auth/login', (req, res) => {
@@ -116,6 +135,15 @@ app.post('/api/auth/login', (req, res) => {
   const previousFailures = loginFailures.get(clientKey);
   if (previousFailures && previousFailures.resetAt > now && previousFailures.count >= 8) {
     return res.status(429).json({ error: 'Too many sign-in attempts. Please wait 15 minutes and try again.' });
+  }
+
+  const rawUsername = typeof req.body?.username === 'string' ? req.body.username : '';
+  if (/[\u0000-\u001f\u007f]/.test(rawUsername)) {
+    return res.status(400).json({ error: 'Enter a username up to 48 characters.' });
+  }
+  const suppliedUsername = rawUsername.trim().replace(/\s+/g, ' ');
+  if (!suppliedUsername || suppliedUsername.length > 48) {
+    return res.status(400).json({ error: 'Enter a username up to 48 characters.' });
   }
 
   const suppliedPassword = typeof req.body?.password === 'string' ? req.body.password : '';
@@ -129,10 +157,11 @@ app.post('/api/auth/login', (req, res) => {
   loginFailures.delete(clientKey);
 
   const expiresAt = Date.now() + SESSION_TTL_SECONDS * 1000;
-  const token = `${expiresAt}.${signSession(expiresAt)}`;
+  const encodedUsername = Buffer.from(suppliedUsername).toString('base64url');
+  const token = `${expiresAt}.${encodedUsername}.${signSession(expiresAt, suppliedUsername)}`;
   res.set('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_SECONDS}${IS_PRODUCTION ? '; Secure' : ''}`);
   res.set('Cache-Control', 'no-store');
-  return res.json({ authenticated: true });
+  return res.json({ authenticated: true, username: suppliedUsername });
 });
 
 app.post('/api/auth/logout', (_req, res) => {

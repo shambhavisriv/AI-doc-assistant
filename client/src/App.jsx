@@ -223,6 +223,8 @@ function App() {
   const [authRequired, setAuthRequired] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
   const [authError, setAuthError] = useState('');
+  const [username, setUsername] = useState('');
+  const [signedInUsername, setSignedInUsername] = useState('');
   const [password, setPassword] = useState('');
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [databaseStatus, setDatabaseStatus] = useState('checking');
@@ -254,6 +256,7 @@ function App() {
         if (!active) return;
         setAuthRequired(status.required);
         setAuthenticated(status.authenticated);
+        setSignedInUsername(status.username || '');
       })
       .catch((requestError) => {
         if (!active) return;
@@ -268,6 +271,7 @@ function App() {
   useEffect(() => {
     const expireSession = () => {
       setAuthenticated(false);
+      setSignedInUsername('');
       setAuthError('Your sign-in expired. Please enter your workspace password again.');
     };
     window.addEventListener('workspace-auth-required', expireSession);
@@ -540,11 +544,13 @@ function App() {
     setAuthSubmitting(true);
     setAuthError('');
     try {
-      await apiRequest('/api/auth/login', {
+      const session = await apiRequest('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({ username, password }),
       });
+      setSignedInUsername(session.username || username.trim().replace(/\s+/g, ' '));
+      setUsername('');
       setPassword('');
       setAuthenticated(true);
     } catch (requestError) {
@@ -561,6 +567,7 @@ function App() {
       setAuthError('We could not reach the server to sign out. Your session may still be active.');
     } finally {
       setAuthenticated(false);
+      setSignedInUsername('');
       setMessages([]);
       setActiveConversationId(null);
       setView('assistant');
@@ -568,6 +575,8 @@ function App() {
   };
 
   const selectedCount = selectedIds.length;
+  const headerUsername = signedInUsername || 'Workspace';
+  const headerInitial = Array.from(headerUsername)[0]?.toUpperCase() || 'W';
   const documentRows = (
     <div className="document-list">
       <div className="document-board">
@@ -610,14 +619,15 @@ function App() {
           <div className="auth-art"><div className="auth-flower">✿</div><div className="auth-orb" /><div className="auth-book"><DocumentIcon /><i /><i /><i /></div></div>
           <p className="auth-eyebrow">YOUR PRIVATE READING NOOK</p>
           <h1 id="auth-title">A cozy spot for<br />your big ideas.</h1>
-          <p className="auth-copy">Sign in to pick up where your notes and questions left off.</p>
+          <p className="auth-copy">Enter the workspace password and choose the name shown in your header.</p>
           <form className="auth-form" onSubmit={handleLogin}>
+            <label htmlFor="workspace-username">Username</label>
+            <input id="workspace-username" type="text" value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" maxLength={48} placeholder="What should we call you?" required />
             <label htmlFor="workspace-password">Workspace password</label>
             <input id="workspace-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" required />
             {authError && <p className="auth-error" role="alert">{authError}</p>}
-            <button type="submit" disabled={authSubmitting || !password}>{authSubmitting ? 'Opening your nook…' : 'Come on in'}<ArrowRightIcon /></button>
+            <button type="submit" disabled={authSubmitting || !username.trim() || !password}>{authSubmitting ? 'Opening your nook…' : 'Come on in'}<ArrowRightIcon /></button>
           </form>
-          <div className="auth-footnote"><span className="topbar-tag-dot" /> Your notes are tucked away safely</div>
         </section>
       </main>
     );
@@ -631,7 +641,6 @@ function App() {
           <div className="brand-copy"><span>AI Doc</span><span>Assistant</span></div>
         </div>
 
-        <div className="sidebar-section-label">WORKSPACE</div>
         <nav className="sidebar-nav" aria-label="Workspace">
           <button
             type="button"
@@ -682,17 +691,6 @@ function App() {
           )}
         </div>
 
-        <div className="sidebar-note">
-          <div className="sidebar-note-icon"><SparkleIcon /></div>
-          <p className="sidebar-note-title">Answers with receipts</p>
-          <p className="sidebar-note-copy">Ask across your files and check the passages behind each answer.</p>
-        </div>
-
-        <div className="sidebar-profile">
-          <div className="profile-avatar">D</div>
-          <div className="profile-copy"><span>My little library</span><small>{documents.length} notes in your nook</small></div>
-          {authRequired && <button type="button" className="signout-button" onClick={handleLogout} title="Sign out" aria-label="Sign out">↗</button>}
-        </div>
       </aside>
 
       <div className="main-column">
@@ -701,7 +699,14 @@ function App() {
             <span>Workspace</span><span className="breadcrumb-divider">/</span>
             <strong>{view === 'library' ? 'Documents' : 'Ask assistant'}</strong>
           </div>
-          <div className={`topbar-tag db-${databaseStatus}`}><span className="topbar-tag-dot" /> {databaseStatus === 'connected' ? 'MongoDB connected' : databaseStatus === 'checking' ? 'Waking MongoDB…' : 'MongoDB offline'}</div>
+          <div className="topbar-actions">
+            <div className={`topbar-tag db-${databaseStatus}`} title={`MongoDB ${databaseStatus}`} aria-label={`MongoDB ${databaseStatus}`}><span className="topbar-tag-dot" /><span className="database-label">MongoDB {databaseStatus === 'connected' ? 'connected' : databaseStatus === 'checking' ? 'connecting' : 'offline'}</span></div>
+            {signedInUsername && <div className="header-user" title={`Signed in as ${headerUsername}`}>
+              <span className="header-user-avatar" aria-hidden="true">{headerInitial}</span>
+              <span className="header-user-name">{headerUsername}</span>
+            </div>}
+            {authRequired && <button type="button" className="header-signout" onClick={handleLogout} title="Sign out">Sign out</button>}
+          </div>
         </header>
 
         <main className={`main-content${view === 'library' ? ' library-content' : ''}`}>
