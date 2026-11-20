@@ -1,0 +1,7 @@
+node_modules
+dist/
+
+# Local credentials and environment settings
+.env
+.env.*
+!.env.example
