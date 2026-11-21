@@ -65,6 +65,8 @@
 .header-user-name { overflow: hidden; font-size: 10px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .header-signout { min-height: 31px; padding: 0 10px; color: #786883; background: transparent; border: 1px solid #e9dfeb; border-radius: 9px; cursor: pointer; font: inherit; font-size: 10px; font-weight: 650; white-space: nowrap; }
 .header-signout:hover { color: #5a4074; background: #fffdf9; }
+.header-signout:disabled { opacity: .62; cursor: wait; }
+.signout-short { display: none; }
 
 .main-content { width: min(100%, 1000px); margin: 0 auto; padding: 48px clamp(22px, 6vw, 88px) 29px; }
 .main-content.library-content { width: min(100%, 1100px); }
@@ -309,6 +311,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .header-user-avatar { width: 24px; height: 24px; flex-basis: 24px; }
   .header-user-name { font-size: 9px; }
   .header-signout { min-height: 27px; padding: 0 6px; font-size: 9px; }
+  .signout-full { display: none; }
+  .signout-short { display: inline; }
 }
 
 @media (max-width: 430px) {
@@ -494,6 +498,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .auth-form button:disabled { opacity: .62; cursor: wait; }
 .auth-form button svg { width: 17px; height: 17px; }
 .auth-error { margin: 0; color: #a05054; font-size: 10px; line-height: 1.5; }
+.auth-switch { margin: 17px 0 0; color: #8a7d91; text-align: center; font-size: 10px; }
+.auth-switch button { padding: 0; color: #765795; background: transparent; border: 0; cursor: pointer; font: inherit; font-weight: 750; }
+.auth-switch button:hover { color: #543878; text-decoration: underline; }
 .auth-loading { display: flex; align-items: center; gap: 12px; color: #806d8f; font-family: Georgia, serif; font-size: 14px; }
 .auth-loading .brand-mark { width: 36px; height: 36px; flex-basis: 36px; }
 

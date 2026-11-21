@@ -223,10 +223,13 @@ function App() {
   const [authRequired, setAuthRequired] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
   const [authError, setAuthError] = useState('');
-  const [username, setUsername] = useState('');
+  const [authMode, setAuthMode] = useState('login');
+  const [displayName, setDisplayName] = useState('');
+  const [email, setEmail] = useState('');
   const [signedInUsername, setSignedInUsername] = useState('');
   const [password, setPassword] = useState('');
   const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
   const [databaseStatus, setDatabaseStatus] = useState('checking');
   const [view, setView] = useState('assistant');
   const [question, setQuestion] = useState('');
@@ -249,6 +252,25 @@ function App() {
   const [searchLoading, setSearchLoading] = useState(false);
   const fileInputRef = useRef(null);
 
+  const clearWorkspaceState = useCallback(() => {
+    setView('assistant');
+    setQuestion('');
+    setDocuments([]);
+    setSelectedDocIds(null);
+    setConversations([]);
+    setActiveConversationId(null);
+    setMessages([]);
+    setLoading(false);
+    setPendingQuestion('');
+    setError('');
+    setNotice('');
+    setContextOpen(false);
+    setDocumentSearch('');
+    setSearchResults([]);
+    setSearchResultsFor('');
+    setSearchLoading(false);
+  }, []);
+
   useEffect(() => {
     let active = true;
     apiRequest('/api/auth/status')
@@ -256,7 +278,8 @@ function App() {
         if (!active) return;
         setAuthRequired(status.required);
         setAuthenticated(status.authenticated);
-        setSignedInUsername(status.username || '');
+        setSignedInUsername(status.user?.displayName || '');
+        if (!status.authenticated) clearWorkspaceState();
       })
       .catch((requestError) => {
         if (!active) return;
@@ -266,17 +289,18 @@ function App() {
       })
       .finally(() => { if (active) setAuthReady(true); });
     return () => { active = false; };
-  }, []);
+  }, [clearWorkspaceState]);
 
   useEffect(() => {
     const expireSession = () => {
       setAuthenticated(false);
       setSignedInUsername('');
-      setAuthError('Your sign-in expired. Please enter your workspace password again.');
+      clearWorkspaceState();
+      setAuthError('Your sign-in expired. Please sign in again.');
     };
     window.addEventListener('workspace-auth-required', expireSession);
     return () => window.removeEventListener('workspace-auth-required', expireSession);
-  }, []);
+  }, [clearWorkspaceState]);
 
   useEffect(() => {
     let active = true;
@@ -543,15 +567,18 @@ function App() {
     if (authSubmitting) return;
     setAuthSubmitting(true);
     setAuthError('');
+    const signingUp = authMode === 'signup';
     try {
-      const session = await apiRequest('/api/auth/login', {
+      const session = await apiRequest(`/api/auth/${signingUp ? 'signup' : 'login'}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify(signingUp ? { displayName, email, password } : { email, password }),
       });
-      setSignedInUsername(session.username || username.trim().replace(/\s+/g, ' '));
-      setUsername('');
+      setSignedInUsername(session.user?.displayName || displayName.trim().replace(/\s+/g, ' '));
+      setDisplayName('');
+      setEmail('');
       setPassword('');
+      clearWorkspaceState();
       setAuthenticated(true);
     } catch (requestError) {
       setAuthError(requestError.message);
@@ -561,16 +588,25 @@ function App() {
   };
 
   const handleLogout = async () => {
+    if (signingOut) return;
+    setSigningOut(true);
+    setError('');
     try {
-      await apiRequest('/api/auth/logout', { method: 'POST' });
-    } catch {
-      setAuthError('We could not reach the server to sign out. Your session may still be active.');
-    } finally {
+      await apiRequest('/api/auth/logout-all', { method: 'POST' });
       setAuthenticated(false);
       setSignedInUsername('');
-      setMessages([]);
-      setActiveConversationId(null);
-      setView('assistant');
+      clearWorkspaceState();
+    } catch (requestError) {
+      if (requestError.message.includes('session has expired')) {
+        setAuthenticated(false);
+        setSignedInUsername('');
+        clearWorkspaceState();
+        setAuthError('Your sign-in expired. Please sign in again.');
+      } else {
+        setError(requestError.message || 'Could not sign out everywhere. Please try again.');
+      }
+    } finally {
+      setSigningOut(false);
     }
   };
 
@@ -619,15 +655,20 @@ function App() {
           <div className="auth-art"><div className="auth-flower">✿</div><div className="auth-orb" /><div className="auth-book"><DocumentIcon /><i /><i /><i /></div></div>
           <p className="auth-eyebrow">YOUR PRIVATE READING NOOK</p>
           <h1 id="auth-title">A cozy spot for<br />your big ideas.</h1>
-          <p className="auth-copy">Enter the workspace password and choose the name shown in your header.</p>
+          <p className="auth-copy">{authMode === 'signup' ? 'Create an account to keep your documents and conversations private.' : 'Sign in to open your personal document workspace.'}</p>
           <form className="auth-form" onSubmit={handleLogin}>
-            <label htmlFor="workspace-username">Username</label>
-            <input id="workspace-username" type="text" value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" maxLength={48} placeholder="What should we call you?" required />
-            <label htmlFor="workspace-password">Workspace password</label>
-            <input id="workspace-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" required />
+            {authMode === 'signup' && <>
+              <label htmlFor="account-name">Name</label>
+              <input id="account-name" type="text" value={displayName} onChange={(event) => setDisplayName(event.target.value)} autoComplete="name" maxLength={48} placeholder="What should we call you?" required />
+            </>}
+            <label htmlFor="account-email">Email</label>
+            <input id="account-email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" maxLength={254} placeholder="you@example.com" required />
+            <label htmlFor="account-password">Password</label>
+            <input id="account-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'} minLength={authMode === 'signup' ? 8 : undefined} maxLength={128} required />
             {authError && <p className="auth-error" role="alert">{authError}</p>}
-            <button type="submit" disabled={authSubmitting || !username.trim() || !password}>{authSubmitting ? 'Opening your nook…' : 'Come on in'}<ArrowRightIcon /></button>
+            <button type="submit" disabled={authSubmitting || !email.trim() || !password || (authMode === 'signup' && !displayName.trim())}>{authSubmitting ? (authMode === 'signup' ? 'Creating your account…' : 'Signing you in…') : (authMode === 'signup' ? 'Create account' : 'Sign in')}<ArrowRightIcon /></button>
           </form>
+          <p className="auth-switch">{authMode === 'signup' ? 'Already have an account?' : 'New to the library?'} <button type="button" onClick={() => { setAuthMode(authMode === 'signup' ? 'login' : 'signup'); setAuthError(''); }}>{authMode === 'signup' ? 'Sign in' : 'Create an account'}</button></p>
         </section>
       </main>
     );
@@ -705,7 +746,7 @@ function App() {
               <span className="header-user-avatar" aria-hidden="true">{headerInitial}</span>
               <span className="header-user-name">{headerUsername}</span>
             </div>}
-            {authRequired && <button type="button" className="header-signout" onClick={handleLogout} title="Sign out">Sign out</button>}
+            {authRequired && <button type="button" className="header-signout" onClick={handleLogout} disabled={signingOut} title="Sign out on every device" aria-label="Sign out on every device">{signingOut ? 'Signing out…' : <><span className="signout-full">Sign out everywhere</span><span className="signout-short">Sign out</span></>}</button>}
           </div>
         </header>
 

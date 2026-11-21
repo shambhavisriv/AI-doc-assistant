@@ -16,10 +16,6 @@ services:
         value: ai-doc-assistant
       - key: ANTHROPIC_MODEL
         value: claude-sonnet-5
-      - key: APP_SESSION_SECRET
-        generateValue: true
-      - key: APP_PASSWORD
-        sync: false
       - key: MONGODB_URI
         sync: false
       - key: ANTHROPIC_API_KEY

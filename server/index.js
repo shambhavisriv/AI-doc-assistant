@@ -1,5 +1,6 @@
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { promisify } = require('node:util');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const express = require('express');
@@ -10,16 +11,21 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { PDFParse } = require('pdf-parse');
 const Document = require('./models/Document');
 const Conversation = require('./models/Conversation');
+const User = require('./models/User');
+const Session = require('./models/Session');
 const { getRelevantPassages } = require('./services/retrieval');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-const APP_PASSWORD = process.env.APP_PASSWORD || '';
-const SESSION_SECRET = process.env.APP_SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const SESSION_COOKIE = 'doc_assistant_session';
 const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
 const loginFailures = new Map();
+const scrypt = promisify(crypto.scrypt);
+const DUMMY_PASSWORD_SALT = crypto.randomBytes(16).toString('hex');
+let databaseReady = false;
+mongoose.connection.on('disconnected', () => { databaseReady = false; });
+mongoose.connection.on('reconnected', () => { databaseReady = true; });
 app.set('trust proxy', 1);
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 const MAX_EXTRACTED_CHARACTERS = 1_000_000;
@@ -60,117 +66,216 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '1mb' }));
 
-function signSession(expiresAt, username) {
-  return crypto.createHmac('sha256', SESSION_SECRET).update(`${expiresAt}.${username}`).digest('hex');
-}
-
-function getSessionUsername(req) {
+function getSessionToken(req) {
   const cookie = req.headers.cookie || '';
   const match = cookie.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]+)`));
   if (!match) return '';
 
-  let decodedCookie;
+  let token;
   try {
-    decodedCookie = decodeURIComponent(match[1]);
+    token = decodeURIComponent(match[1]);
   } catch {
     return '';
   }
-  const [expiresAtText, encodedUsername, suppliedSignature] = decodedCookie.split('.');
-  const expiresAt = Number(expiresAtText);
-  if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now() || !encodedUsername) return '';
-
-  let username;
-  try {
-    username = Buffer.from(encodedUsername, 'base64url').toString('utf8');
-  } catch {
-    return '';
-  }
-  if (!username || username.length > 48) return '';
-
-  const expectedSignature = signSession(expiresAt, username);
-  const supplied = Buffer.from(suppliedSignature || '', 'hex');
-  const expected = Buffer.from(expectedSignature, 'hex');
-  return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected)
-    ? username
-    : '';
+  return /^[A-Za-z0-9_-]{40,60}$/.test(token) ? token : '';
 }
 
-function hasValidSession(req) {
-  return Boolean(getSessionUsername(req));
+function hashSessionToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-function requireWorkspaceAccess(req, res, next) {
-  if (APP_PASSWORD && !hasValidSession(req)) {
-    return res.status(401).json({ error: 'Your workspace session has expired. Sign in to continue.' });
-  }
+async function findCurrentSession(req) {
+  const token = getSessionToken(req);
+  if (!token) return null;
+  if (!databaseReady) throw new Error('Database is not ready for session lookup.');
+  return Session.findOne({ tokenHash: hashSessionToken(token), expiresAt: { $gt: new Date() } })
+    .populate('userId', 'displayName email')
+    .exec();
+}
 
-  if (APP_PASSWORD && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
-    const origin = req.get('origin');
-    const expectedOrigin = process.env.CLIENT_ORIGIN || (
-      IS_PRODUCTION ? `${req.protocol}://${req.get('host')}` : 'http://localhost:5173'
-    );
-    if (origin && origin !== expectedOrigin) {
-      return res.status(403).json({ error: 'Cross-site requests are not accepted.' });
-    }
-  }
+function setSessionCookie(res, token) {
+  res.set('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_SECONDS}${IS_PRODUCTION ? '; Secure' : ''}`);
+}
 
+function clearSessionCookie(res) {
+  res.set('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${IS_PRODUCTION ? '; Secure' : ''}`);
+}
+
+async function createSession(user, res) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000);
+  await Session.create({ userId: user._id, tokenHash: hashSessionToken(token), expiresAt });
+  setSessionCookie(res, token);
+}
+
+function isRateLimited(clientKey, now) {
+  const previousFailures = loginFailures.get(clientKey);
+  return Boolean(previousFailures && previousFailures.resetAt > now && previousFailures.count >= 8);
+}
+
+function recordAuthFailure(clientKey, now) {
+  const previousFailures = loginFailures.get(clientKey);
+  const count = previousFailures && previousFailures.resetAt > now ? previousFailures.count + 1 : 1;
+  loginFailures.set(clientKey, { count, resetAt: now + 15 * 60 * 1000 });
+}
+
+function requireSameOrigin(req, res, next) {
+  const origin = req.get('origin');
+  const expectedOrigin = process.env.CLIENT_ORIGIN || (
+    IS_PRODUCTION ? `${req.protocol}://${req.get('host')}` : 'http://localhost:5173'
+  );
+  if (origin && origin !== expectedOrigin) {
+    return res.status(403).json({ error: 'Cross-site requests are not accepted.' });
+  }
   return next();
 }
 
-app.get('/api/auth/status', (req, res) => {
-  res.set('Cache-Control', 'no-store');
-  const username = getSessionUsername(req);
-  res.json({
-    required: Boolean(APP_PASSWORD),
-    authenticated: !APP_PASSWORD || Boolean(username),
-    username,
-  });
-});
+async function requireAuthentication(req, res, next) {
+  try {
+    if (!databaseReady) return res.status(503).json({ error: 'The database is starting. Please try again shortly.' });
+    const session = await findCurrentSession(req);
+    if (!session?.userId) {
+      clearSessionCookie(res);
+      return res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
+    }
 
-app.post('/api/auth/login', (req, res) => {
-  if (!APP_PASSWORD) return res.json({ authenticated: true });
+    req.authSession = session;
+    req.user = session.userId;
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+      return requireSameOrigin(req, res, next);
+    }
+    return next();
+  } catch (error) {
+    console.error('Session lookup error:', error.message);
+    return res.status(503).json({ error: 'Could not verify your session. Please try again.' });
+  }
+}
 
+async function passwordDigest(password, salt) {
+  return (await scrypt(password, salt, 64)).toString('hex');
+}
+
+function publicUser(user) {
+  return { id: String(user._id), displayName: user.displayName, email: user.email };
+}
+
+function authRateLimit(req, res, next) {
   const clientKey = req.ip || req.socket.remoteAddress || 'unknown';
-  const now = Date.now();
-  const previousFailures = loginFailures.get(clientKey);
-  if (previousFailures && previousFailures.resetAt > now && previousFailures.count >= 8) {
-    return res.status(429).json({ error: 'Too many sign-in attempts. Please wait 15 minutes and try again.' });
+  if (isRateLimited(clientKey, Date.now())) {
+    return res.status(429).json({ error: 'Too many attempts. Please wait 15 minutes and try again.' });
   }
+  req.authClientKey = clientKey;
+  return next();
+}
 
-  const rawUsername = typeof req.body?.username === 'string' ? req.body.username : '';
-  if (/[\u0000-\u001f\u007f]/.test(rawUsername)) {
-    return res.status(400).json({ error: 'Enter a username up to 48 characters.' });
-  }
-  const suppliedUsername = rawUsername.trim().replace(/\s+/g, ' ');
-  if (!suppliedUsername || suppliedUsername.length > 48) {
-    return res.status(400).json({ error: 'Enter a username up to 48 characters.' });
-  }
+function requireDatabaseReady(_req, res, next) {
+  if (!databaseReady) return res.status(503).json({ error: 'The database is starting. Please try again shortly.' });
+  return next();
+}
 
+app.get('/api/auth/status', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const session = await findCurrentSession(req);
+    return res.json({ required: true, authenticated: Boolean(session?.userId), user: session?.userId ? publicUser(session.userId) : null });
+  } catch (error) {
+    console.error('Auth status error:', error.message);
+    return res.status(503).json({ error: 'Could not check your sign-in. Please refresh the page.' });
+  }
+});
+
+app.post('/api/auth/signup', requireSameOrigin, authRateLimit, requireDatabaseReady, async (req, res) => {
+  const rawDisplayName = typeof req.body?.displayName === 'string' ? req.body.displayName : '';
+  const displayName = rawDisplayName.trim().replace(/\s+/g, ' ');
+  if (/[\u0000-\u001f\u007f]/.test(rawDisplayName) || displayName.length < 2 || displayName.length > 48) {
+    return res.status(400).json({ error: 'Enter a name between 2 and 48 characters.' });
+  }
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Enter a valid email address.' });
+  }
   const suppliedPassword = typeof req.body?.password === 'string' ? req.body.password : '';
-  const expectedHash = crypto.createHash('sha256').update(APP_PASSWORD).digest();
-  const suppliedHash = crypto.createHash('sha256').update(suppliedPassword).digest();
-  if (!crypto.timingSafeEqual(expectedHash, suppliedHash)) {
-    const count = previousFailures && previousFailures.resetAt > now ? previousFailures.count + 1 : 1;
-    loginFailures.set(clientKey, { count, resetAt: now + 15 * 60 * 1000 });
-    return res.status(401).json({ error: 'That password did not match. Try again.' });
+  if (suppliedPassword.length < 8 || suppliedPassword.length > 128) {
+    return res.status(400).json({ error: 'Use a password between 8 and 128 characters.' });
   }
-  loginFailures.delete(clientKey);
 
-  const expiresAt = Date.now() + SESSION_TTL_SECONDS * 1000;
-  const encodedUsername = Buffer.from(suppliedUsername).toString('base64url');
-  const token = `${expiresAt}.${encodedUsername}.${signSession(expiresAt, suppliedUsername)}`;
-  res.set('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_SECONDS}${IS_PRODUCTION ? '; Secure' : ''}`);
-  res.set('Cache-Control', 'no-store');
-  return res.json({ authenticated: true, username: suppliedUsername });
+  try {
+    const salt = crypto.randomBytes(16).toString('hex');
+    const passwordHash = await passwordDigest(suppliedPassword, salt);
+    const user = await User.create({ displayName, email, passwordHash, passwordSalt: salt });
+    await createSession(user, res);
+    loginFailures.delete(req.authClientKey);
+    res.set('Cache-Control', 'no-store');
+    return res.status(201).json({ authenticated: true, user: publicUser(user) });
+  } catch (error) {
+    if (error.code === 11000 && error.keyPattern?.email) {
+      recordAuthFailure(req.authClientKey, Date.now());
+      return res.status(409).json({ error: 'An account with that email already exists.' });
+    }
+    console.error('Sign-up error:', error.message);
+    return res.status(503).json({ error: 'Could not create your account. Please try again.' });
+  }
 });
 
-app.post('/api/auth/logout', (_req, res) => {
-  res.set('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${IS_PRODUCTION ? '; Secure' : ''}`);
-  res.set('Cache-Control', 'no-store');
-  return res.json({ authenticated: false });
+app.post('/api/auth/login', requireSameOrigin, authRateLimit, requireDatabaseReady, async (req, res) => {
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const suppliedPassword = typeof req.body?.password === 'string' ? req.body.password : '';
+  if (!email || email.length > 254 || suppliedPassword.length > 128) {
+    recordAuthFailure(req.authClientKey, Date.now());
+    return res.status(401).json({ error: 'Email or password is incorrect.' });
+  }
+
+  try {
+    const user = await User.findOne({ email }).select('+passwordHash +passwordSalt');
+    if (!user) {
+      await passwordDigest(suppliedPassword, DUMMY_PASSWORD_SALT);
+      recordAuthFailure(req.authClientKey, Date.now());
+      return res.status(401).json({ error: 'Email or password is incorrect.' });
+    }
+
+    const expected = Buffer.from(user.passwordHash, 'hex');
+    const supplied = Buffer.from(await passwordDigest(suppliedPassword, user.passwordSalt), 'hex');
+    if (expected.length !== supplied.length || !crypto.timingSafeEqual(expected, supplied)) {
+      recordAuthFailure(req.authClientKey, Date.now());
+      return res.status(401).json({ error: 'Email or password is incorrect.' });
+    }
+
+    await createSession(user, res);
+    loginFailures.delete(req.authClientKey);
+    res.set('Cache-Control', 'no-store');
+    return res.json({ authenticated: true, user: publicUser(user) });
+  } catch (error) {
+    console.error('Login error:', error.message);
+    return res.status(503).json({ error: 'Could not sign in. Please try again.' });
+  }
 });
 
-app.use('/api', requireWorkspaceAccess);
+app.post('/api/auth/logout', requireSameOrigin, requireDatabaseReady, async (req, res) => {
+  try {
+    const token = getSessionToken(req);
+    if (token) await Session.deleteOne({ tokenHash: hashSessionToken(token) });
+    clearSessionCookie(res);
+    res.set('Cache-Control', 'no-store');
+    return res.json({ authenticated: false });
+  } catch (error) {
+    console.error('Logout error:', error.message);
+    return res.status(503).json({ error: 'Could not sign out. Please try again.' });
+  }
+});
+
+app.post('/api/auth/logout-all', requireAuthentication, async (req, res) => {
+  try {
+    await Session.deleteMany({ userId: req.user._id });
+    clearSessionCookie(res);
+    res.set('Cache-Control', 'no-store');
+    return res.json({ authenticated: false, sessionsRevoked: true });
+  } catch (error) {
+    console.error('Sign out everywhere error:', error.message);
+    return res.status(503).json({ error: 'Could not sign out everywhere. Please try again.' });
+  }
+});
+
+app.use('/api', requireAuthentication);
 
 function normalizeText(value) {
   return value
@@ -305,9 +410,9 @@ app.get('/health', (_req, res) => {
   });
 });
 
-app.get('/api/docs', async (_req, res) => {
+app.get('/api/docs', async (req, res) => {
   try {
-    const documents = await Document.find()
+    const documents = await Document.find({ ownerId: req.user._id })
       .select('name extension mimeType size createdAt passages')
       .slice('passages', 1)
       .sort({ createdAt: -1 })
@@ -326,7 +431,7 @@ app.get('/api/docs/search', async (req, res) => {
   }
 
   try {
-    const documents = await Document.find().select('name passages').lean();
+    const documents = await Document.find({ ownerId: req.user._id }).select('name passages').lean();
     const matches = getRelevantPassages(query, documents, 20);
     const results = matches.map((match) => ({
       id: String(match.documentId),
@@ -350,6 +455,7 @@ app.post('/api/docs/upload', upload.single('file'), async (req, res) => {
     const extension = path.extname(req.file.originalname).toLowerCase();
     const { passages } = await extractDocument(req.file, extension);
     const document = await Document.create({
+      ownerId: req.user._id,
       name: path.basename(req.file.originalname).slice(0, 240),
       extension,
       mimeType: MIME_TYPES[extension],
@@ -383,7 +489,7 @@ app.get('/api/docs/:id/file', async (req, res) => {
   }
 
   try {
-    const document = await Document.findById(req.params.id).select('+originalFile');
+    const document = await Document.findOne({ _id: req.params.id, ownerId: req.user._id }).select('+originalFile');
     if (!document) return res.status(404).json({ error: 'Document not found.' });
 
     const filename = encodeURIComponent(document.name).replace(/[!'()*]/g, (character) =>
@@ -408,7 +514,7 @@ app.delete('/api/docs/:id', async (req, res) => {
   }
 
   try {
-    const document = await Document.findByIdAndDelete(req.params.id);
+    const document = await Document.findOneAndDelete({ _id: req.params.id, ownerId: req.user._id });
     if (!document) return res.status(404).json({ error: 'Document not found.' });
     return res.json({ success: true, id: String(document._id) });
   } catch (error) {
@@ -417,9 +523,9 @@ app.delete('/api/docs/:id', async (req, res) => {
   }
 });
 
-app.get('/api/conversations', async (_req, res) => {
+app.get('/api/conversations', async (req, res) => {
   try {
-    const conversations = await Conversation.find()
+    const conversations = await Conversation.find({ ownerId: req.user._id })
       .select('title updatedAt messages.role messages.content')
       .sort({ updatedAt: -1 })
       .limit(40)
@@ -437,7 +543,7 @@ app.get('/api/conversations/:id', async (req, res) => {
   }
 
   try {
-    const conversation = await Conversation.findById(req.params.id).lean();
+    const conversation = await Conversation.findOne({ _id: req.params.id, ownerId: req.user._id }).lean();
     if (!conversation) return res.status(404).json({ error: 'Conversation not found.' });
     res.json({
       conversation: {
@@ -480,11 +586,11 @@ app.post('/api/docs/query', async (req, res) => {
   try {
     const [selectedDocuments, conversation] = await Promise.all([
       documentIds === null
-        ? Document.find().select('name passages').lean()
+        ? Document.find({ ownerId: req.user._id }).select('name passages').lean()
         : documentIds.length
-          ? Document.find({ _id: { $in: documentIds } }).select('name passages').lean()
+          ? Document.find({ _id: { $in: documentIds }, ownerId: req.user._id }).select('name passages').lean()
           : Promise.resolve([]),
-      conversationId ? Conversation.findById(conversationId) : Promise.resolve(null),
+      conversationId ? Conversation.findOne({ _id: conversationId, ownerId: req.user._id }) : Promise.resolve(null),
     ]);
 
     if (conversationId && !conversation) {
@@ -521,6 +627,7 @@ app.post('/api/docs/query', async (req, res) => {
       .trim() || 'Sorry, I could not generate an answer.';
 
     const targetConversation = conversation || new Conversation({
+      ownerId: req.user._id,
       title: question.length > 72 ? `${question.slice(0, 69).trim()}…` : question,
       messages: [],
     });
@@ -576,11 +683,6 @@ app.use((error, _req, res, _next) => {
 });
 
 async function startServer() {
-  if (IS_PRODUCTION && (!APP_PASSWORD || !process.env.APP_SESSION_SECRET)) {
-    console.error('Set APP_PASSWORD and APP_SESSION_SECRET before starting in production.');
-    process.exit(1);
-  }
-
   const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/ai-doc-assistant';
   const databaseOptions = { dbName: process.env.MONGODB_DB || 'ai-doc-assistant' };
 
@@ -591,6 +693,8 @@ async function startServer() {
   while (true) {
     try {
       await mongoose.connect(mongoUri, databaseOptions);
+      await Promise.all([User.init(), Session.init(), Document.init(), Conversation.init()]);
+      databaseReady = true;
       console.log('Connected to MongoDB');
       break;
     } catch (error) {
